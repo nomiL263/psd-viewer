@@ -553,7 +553,7 @@ class MainWindow(QMainWindow):
         self._placeholder.show()
         self._viewer.hide()
         self._status.showMessage(f"加载失败: {error_msg}")
-        QMessageBox.critical(self, "加载失败", f"无法解析该文件：\n\n{error_msg}")
+        QMessageBox.critical(self, "预览失败", f"{error_msg}")
 
     def _export_png(self):
         if self._current_image is None:
