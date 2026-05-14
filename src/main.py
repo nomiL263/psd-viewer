@@ -1,12 +1,8 @@
 """
 PSD/PSB 预览器 - 主 GUI 界面
 
-参照 2345看图王 / WPS图片 的加载逻辑：
-  1. 打开文件立即读内嵌缩略图显示（< 0.3s，不卡）
-  2. 后台线程合并图层得到高清图，完成后无缝替换
-  3. 切换文件时立即取消旧任务，旧线程安全等待退出
-  4. 大图自动限制传给 UI 的内存用量，防 OOM 闪退
-  5. 所有跨线程数据通过 bytes 传递，避免 PIL Image 跨线程引发段错误
+加载策略：单阶段直读内嵌合并图像数据，与 ACDSee/2345看图王 相同速度。
+无"高清加载中"步骤，打开即是高清，适应窗口显示。
 """
 
 import sys
@@ -21,9 +17,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QFrame, QSplitter, QProgressBar, QMessageBox,
     QToolBar,
 )
-from PySide6.QtCore import (
-    Qt, QThread, Signal, QSize, QTimer, QPoint, QMutex,
-)
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QPoint
 from PySide6.QtGui import (
     QPixmap, QImage, QDragEnterEvent, QDropEvent,
     QAction, QKeySequence, QWheelEvent, QPainter, QColor, QPen,
@@ -35,14 +29,21 @@ from psd_renderer import PSDRenderer
 
 
 # ══════════════════════════════════════════════
-#  线程：第一阶段 —— 读内嵌缩略图（极速）
+#  工具：bytes → QPixmap（必须在主线程调用）
 # ══════════════════════════════════════════════
 
-class ThumbLoadWorker(QThread):
-    """
-    只读内嵌缩略图 + 文件头，通常 < 0.3s。
-    用 bytes 传图，不跨线程传 PIL Image（防段错误）。
-    """
+def _to_pixmap(raw: bytes, w: int, h: int) -> QPixmap:
+    qi = QImage(raw, w, h, w * 4, QImage.Format_RGBA8888)
+    qi._keep = raw   # 防 GC
+    return QPixmap.fromImage(qi)
+
+
+# ══════════════════════════════════════════════
+#  主图加载线程
+# ══════════════════════════════════════════════
+
+class LoadWorker(QThread):
+    """后台读取 PSD/PSB，用 bytes 传图防跨线程段错误"""
     done  = Signal(bytes, int, int, dict)   # (rgba_bytes, w, h, meta)
     error = Signal(str)
 
@@ -56,64 +57,22 @@ class ThumbLoadWorker(QThread):
     def run(self):
         try:
             r = PSDRenderer()
-            thumb, meta = r.load_thumbnail(self.file_path)
+            image, meta = r.load(self.file_path)
             if self._cancelled:
-                return
-            if thumb is not None:
-                img = thumb.convert("RGBA")
-                w, h = img.size
-                raw  = img.tobytes("raw", "RGBA")
-                del img; gc.collect()
-                if not self._cancelled:
-                    self.done.emit(raw, w, h, meta)
-            else:
-                # 没有内嵌缩略图，直接进入高清加载
-                if not self._cancelled:
-                    self.done.emit(b"", 0, 0, meta)
-        except Exception as e:
-            if not self._cancelled:
-                self.error.emit(str(e))
-
-
-# ══════════════════════════════════════════════
-#  线程：第二阶段 —— 合并图层高清图（后台）
-# ══════════════════════════════════════════════
-
-class FullLoadWorker(QThread):
-    """
-    后台合并所有图层，得到高清图。
-    同样用 bytes 传图，防跨线程段错误。
-    """
-    done  = Signal(bytes, int, int, str)   # (rgba_bytes, w, h, file_path)
-    error = Signal(str)
-
-    def __init__(self, file_path: str):
-        super().__init__()
-        self.file_path  = file_path
-        self._cancelled = False
-
-    def cancel(self): self._cancelled = True
-
-    def run(self):
-        try:
-            r     = PSDRenderer()
-            image = r.load_full(self.file_path)
-            if self._cancelled:
-                del image; gc.collect()
-                return
+                del image; gc.collect(); return
             img  = image.convert("RGBA")
             w, h = img.size
             raw  = img.tobytes("raw", "RGBA")
             del img, image; gc.collect()
             if not self._cancelled:
-                self.done.emit(raw, w, h, self.file_path)
+                self.done.emit(raw, w, h, meta)
         except Exception as e:
             if not self._cancelled:
                 self.error.emit(str(e))
 
 
 # ══════════════════════════════════════════════
-#  线程：批量读底部缩略图条
+#  底部缩略图条加载线程
 # ══════════════════════════════════════════════
 
 class ThumbBarWorker(QThread):
@@ -129,28 +88,17 @@ class ThumbBarWorker(QThread):
     def run(self):
         r = PSDRenderer()
         for i, fp in enumerate(self.files):
-            if self._cancelled:
-                break
+            if self._cancelled: break
             try:
                 img = r.load_thumbnail_only(fp)
-                if img is not None and not self._cancelled:
-                    img = img.convert("RGBA")
+                if img and not self._cancelled:
+                    img  = img.convert("RGBA")
                     w, h = img.size
                     raw  = img.tobytes("raw", "RGBA")
                     del img
                     self.one_done.emit(i, raw, w, h)
             except Exception:
                 pass
-
-
-# ══════════════════════════════════════════════
-#  工具函数：bytes → QPixmap（主线程内调用）
-# ══════════════════════════════════════════════
-
-def bytes_to_pixmap(raw: bytes, w: int, h: int) -> QPixmap:
-    qimg = QImage(raw, w, h, w * 4, QImage.Format_RGBA8888)
-    qimg._keep = raw   # 防 GC
-    return QPixmap.fromImage(qimg)
 
 
 # ══════════════════════════════════════════════
@@ -162,7 +110,7 @@ class ImageViewer(QScrollArea):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
         self.setWidgetResizable(False)
-        self.setStyleSheet("background-color:#2b2b2b; border:none;")
+        self.setStyleSheet("background:#2b2b2b; border:none;")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
@@ -172,35 +120,17 @@ class ImageViewer(QScrollArea):
         self.setWidget(self._label)
 
         self._pixmap:   Optional[QPixmap] = None
-        self._scale:    float  = 1.0
+        self._scale:    float = 1.0
         self._drag_pos: Optional[QPoint] = None
-        self._is_fit:   bool   = True
+        self._is_fit:   bool  = True
 
     # ── 接口 ──────────────────────────────────
 
-    def set_pixmap(self, pixmap: QPixmap, keep_view: bool = False):
-        """
-        keep_view=False：重置到适应窗口（新文件打开时）
-        keep_view=True ：保持当前缩放和滚动位置（高清替换缩略图时）
-        """
-        old_scale = self._scale
-        old_h_val = self.horizontalScrollBar().value()
-        old_v_val = self.verticalScrollBar().value()
-        old_is_fit = self._is_fit
-
-        self._pixmap = pixmap
-        if not keep_view:
-            self._is_fit = True
-            self._fit_to_window()
-        else:
-            # 按照旧缩放比例重新渲染，然后恢复滚动位置
-            self._scale  = old_scale
-            self._is_fit = old_is_fit
-            self._update_display()
-            QTimer.singleShot(0, lambda: (
-                self.horizontalScrollBar().setValue(old_h_val),
-                self.verticalScrollBar().setValue(old_v_val),
-            ))
+    def set_pixmap(self, pm: QPixmap):
+        """设置新图像，始终以适应窗口方式显示"""
+        self._pixmap = pm
+        self._is_fit = True
+        self._fit_to_window()
 
     def zoom_in(self):
         self._is_fit = False
@@ -223,6 +153,8 @@ class ImageViewer(QScrollArea):
         self._pixmap = None
         self._label.clear()
         self._label.resize(0, 0)
+        self._scale  = 1.0
+        self._is_fit = True
 
     @property
     def scale(self) -> float:
@@ -231,10 +163,9 @@ class ImageViewer(QScrollArea):
     # ── 内部 ──────────────────────────────────
 
     def _fit_to_window(self):
-        if not self._pixmap:
-            return
-        vw = max(1, self.viewport().width()  - 4)
-        vh = max(1, self.viewport().height() - 4)
+        if not self._pixmap: return
+        vw = max(1, self.viewport().width()  - 2)
+        vh = max(1, self.viewport().height() - 2)
         self._scale = min(vw / self._pixmap.width(),
                           vh / self._pixmap.height(), 1.0)
         self._update_display()
@@ -244,30 +175,26 @@ class ImageViewer(QScrollArea):
         self._update_display()
 
     def _update_display(self):
-        if not self._pixmap:
-            return
+        if not self._pixmap: return
         w = max(1, int(self._pixmap.width()  * self._scale))
         h = max(1, int(self._pixmap.height() * self._scale))
         scaled = self._pixmap.scaled(w, h, Qt.KeepAspectRatio,
                                      Qt.SmoothTransformation)
         self._label.setPixmap(scaled)
         self._label.resize(scaled.size())
-        fs = self._fit_scale()
         self.viewport().setCursor(
-            Qt.OpenHandCursor if self._scale > fs else Qt.ArrowCursor)
+            Qt.OpenHandCursor if self._scale > self._fit_scale()
+            else Qt.ArrowCursor)
 
     def _fit_scale(self) -> float:
-        if not self._pixmap:
-            return 1.0
-        return min(
-            self.viewport().width()  / self._pixmap.width(),
-            self.viewport().height() / self._pixmap.height(), 1.0)
+        if not self._pixmap: return 1.0
+        return min(self.viewport().width()  / self._pixmap.width(),
+                   self.viewport().height() / self._pixmap.height(), 1.0)
 
     def _zoom_at(self, factor: float, pos: QPoint):
         old = self._scale
         new = max(0.02, min(16.0, old * factor))
-        if abs(new - old) < 1e-6:
-            return
+        if abs(new - old) < 1e-6: return
         hb, vb = self.horizontalScrollBar(), self.verticalScrollBar()
         ix = (hb.value() + pos.x()) / old
         iy = (vb.value() + pos.y()) / old
@@ -280,8 +207,7 @@ class ImageViewer(QScrollArea):
     # ── 事件 ──────────────────────────────────
 
     def wheelEvent(self, e: QWheelEvent):
-        if not self._pixmap:
-            super().wheelEvent(e); return
+        if not self._pixmap: super().wheelEvent(e); return
         self._zoom_at(1.15 if e.angleDelta().y() > 0 else 1/1.15,
                       e.position().toPoint())
         e.accept()
@@ -320,28 +246,30 @@ class ImageViewer(QScrollArea):
 #  底部缩略图条
 # ══════════════════════════════════════════════
 
-THUMB_W, THUMB_H, CARD_H = 100, 80, 100
+THUMB_W, THUMB_H, CARD_H = 100, 76, 96
 
 class ThumbCard(QWidget):
     clicked = Signal(int)
 
     def __init__(self, index: int, name: str, parent=None):
         super().__init__(parent)
-        self.index     = index
-        self._pixmap:  Optional[QPixmap] = None
-        self._selected = False
-        self._hover    = False
+        self.index      = index
+        self._pm:       Optional[QPixmap] = None
+        self._selected  = False
+        self._hover     = False
         self.setFixedSize(THUMB_W, CARD_H)
         self.setCursor(Qt.PointingHandCursor)
 
         lbl = QLabel(name, self)
         lbl.setAlignment(Qt.AlignCenter)
-        lbl.setGeometry(0, THUMB_H + 2, THUMB_W, CARD_H - THUMB_H - 2)
-        lbl.setStyleSheet("color:#ccc;font-size:9px;background:transparent;")
+        lbl.setGeometry(2, THUMB_H + 1, THUMB_W - 4, CARD_H - THUMB_H - 2)
+        # 关键：背景透明，不用 background 覆盖父控件
+        lbl.setStyleSheet(
+            "color:#ccc; font-size:9px; background:transparent; border:none;")
         lbl.setWordWrap(False)
 
     def set_pixmap(self, pm: Optional[QPixmap]):
-        self._pixmap = pm
+        self._pm = pm
         self.update()
 
     def set_selected(self, v: bool):
@@ -350,21 +278,36 @@ class ThumbCard(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        bg = "#0078d4" if self._selected else ("#3e3e42" if self._hover else "#252526")
-        p.fillRect(self.rect(), QColor(bg))
-        iw, ih, ix, iy = THUMB_W-4, THUMB_H-4, 2, 2
-        if self._pixmap:
-            pw, ph = self._pixmap.width(), self._pixmap.height()
-            p.drawPixmap(ix+(iw-pw)//2, iy+(ih-ph)//2, self._pixmap)
+        p.setRenderHint(QPainter.Antialiasing, False)
+
+        # 背景色
+        bg = QColor("#1a5fa8") if self._selected else (
+              QColor("#3a3a3a") if self._hover else QColor("#1e1e1e"))
+        p.fillRect(self.rect(), bg)
+
+        # 图片区（带圆角背景防黑框）
+        iw, ih = THUMB_W - 6, THUMB_H - 4
+        ix, iy = 3, 2
+        p.fillRect(ix, iy, iw, ih, QColor("#2b2b2b"))
+
+        if self._pm:
+            sw = self._pm.width()
+            sh = self._pm.height()
+            # 居中绘制
+            dx = ix + (iw - sw) // 2
+            dy = iy + (ih - sh) // 2
+            p.drawPixmap(dx, dy, self._pm)
         else:
-            p.setPen(QPen(QColor("#444"), 1))
+            p.setPen(QColor("#444"))
             p.drawRect(ix, iy, iw, ih)
             p.setPen(QColor("#666"))
+            p.setFont(self.font())
             p.drawText(ix, iy, iw, ih, Qt.AlignCenter, "PSD")
+
+        # 选中高亮边框
         if self._selected:
-            p.setPen(QPen(QColor("#fff"), 2))
-            p.drawRect(1, 1, THUMB_W-2, CARD_H-2)
+            p.setPen(QPen(QColor("#4da6ff"), 2))
+            p.drawRect(1, 1, THUMB_W - 2, CARD_H - 2)
 
     def enterEvent(self, _): self._hover = True;  self.update()
     def leaveEvent(self, _): self._hover = False; self.update()
@@ -378,37 +321,51 @@ class ThumbnailBar(QScrollArea):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(CARD_H + 12)
+        self.setFixedHeight(CARD_H + 10)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setWidgetResizable(False)
+        # 关键：背景色与卡片一致，消除黑框感
         self.setStyleSheet("""
-            QScrollArea { background:#1a1a1a; border-top:1px solid #3a3a3a; }
-            QScrollBar:horizontal { height:8px; background:#2a2a2a; border:none; }
+            QScrollArea {
+                background: #1e1e1e;
+                border: none;
+                border-top: 1px solid #333;
+            }
+            QScrollArea > QWidget > QWidget { background: #1e1e1e; }
+            QScrollBar:horizontal {
+                height: 6px; background: #1e1e1e; border: none;
+            }
             QScrollBar::handle:horizontal {
-                background:#555; border-radius:4px; min-width:20px; }
+                background: #555; border-radius: 3px; min-width: 20px;
+            }
             QScrollBar::add-line:horizontal,
-            QScrollBar::sub-line:horizontal { width:0; }
+            QScrollBar::sub-line:horizontal { width: 0; }
         """)
+
         self._container = QWidget()
-        self._container.setStyleSheet("background:#1a1a1a;")
+        self._container.setAutoFillBackground(True)
+        pal = self._container.palette()
+        pal.setColor(self._container.backgroundRole(), QColor("#1e1e1e"))
+        self._container.setPalette(pal)
+
         self._layout = QHBoxLayout(self._container)
-        self._layout.setContentsMargins(6, 4, 6, 4)
-        self._layout.setSpacing(4)
+        self._layout.setContentsMargins(4, 3, 4, 3)
+        self._layout.setSpacing(3)
         self._layout.addStretch()
         self.setWidget(self._container)
+
         self._cards: List[ThumbCard] = []
         self._sel:   int = -1
 
     def reset(self, files: List[str]):
-        for c in self._cards:
-            self._layout.removeWidget(c)
-            c.deleteLater()
+        # 清空旧卡片
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         self._cards.clear()
         self._sel = -1
-        # 移除 stretch
-        while self._layout.count():
-            self._layout.takeAt(0)
 
         for i, fp in enumerate(files):
             c = ThumbCard(i, Path(fp).name, self._container)
@@ -416,28 +373,28 @@ class ThumbnailBar(QScrollArea):
             self._layout.addWidget(c)
             self._cards.append(c)
         self._layout.addStretch()
-        self._container.setFixedWidth(
-            max(len(files) * (THUMB_W+4) + 16, self.width()))
+
+        total_w = len(files) * (THUMB_W + 3) + 12
+        self._container.setFixedWidth(max(total_w, self.width()))
 
     def set_thumb(self, idx: int, raw: bytes, w: int, h: int):
-        if 0 <= idx < len(self._cards) and raw:
-            pm = bytes_to_pixmap(raw, w, h)
-            # 缩到卡片尺寸
-            pm = pm.scaled(THUMB_W-4, THUMB_H-4,
-                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self._cards[idx].set_pixmap(pm)
+        if not (0 <= idx < len(self._cards) and raw):
+            return
+        pm = _to_pixmap(raw, w, h)
+        pm = pm.scaled(THUMB_W - 6, THUMB_H - 4,
+                       Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._cards[idx].set_pixmap(pm)
 
     def set_selected(self, idx: int):
-        if self._sel == idx:
-            return
+        if self._sel == idx: return
         if 0 <= self._sel < len(self._cards):
             self._cards[self._sel].set_selected(False)
         self._sel = idx
         if 0 <= idx < len(self._cards):
             self._cards[idx].set_selected(True)
-            x = idx * (THUMB_W+4) + 6
+            x = idx * (THUMB_W + 3) + 4
             self.horizontalScrollBar().setValue(
-                max(0, x - self.width()//2))
+                max(0, x - self.width() // 2))
 
 
 # ══════════════════════════════════════════════
@@ -447,36 +404,36 @@ class ThumbnailBar(QScrollArea):
 class InfoPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setMinimumWidth(180); self.setMaximumWidth(230)
+        self.setMinimumWidth(175); self.setMaximumWidth(220)
         self.setStyleSheet("""
-            QFrame { background:#1e1e1e; border-right:1px solid #3a3a3a; }
-            QLabel { color:#ccc; font-size:12px; padding:2px 0; }
+            QFrame { background:#1e1e1e; border-right:1px solid #333; }
+            QLabel { color:#ccc; font-size:12px; padding:2px 0;
+                     background:transparent; }
             QLabel#t { color:#fff; font-size:13px; font-weight:bold; }
-            QLabel#k { color:#888; font-size:11px; }
+            QLabel#k { color:#777; font-size:11px; }
         """)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12,16,12,16); lay.setSpacing(4)
+        lay.setContentsMargins(12, 14, 12, 14); lay.setSpacing(3)
         t = QLabel("文件信息"); t.setObjectName("t"); lay.addWidget(t)
-        lay.addSpacing(8)
+        lay.addSpacing(6)
         self._lbl: dict = {}
         for key, name in [
-            ("file_name","文件名"),("file_size","大小"),
-            ("width","宽度"),("height","高度"),
-            ("color_mode","颜色"),("bit_depth","位深"),
+            ("file_name","文件名"), ("file_size","大小"),
+            ("width","宽度"),       ("height","高度"),
+            ("color_mode","颜色"),  ("bit_depth","位深"),
             ("layer_count","图层"),
         ]:
             k = QLabel(name); k.setObjectName("k"); lay.addWidget(k)
             v = QLabel("—"); v.setWordWrap(True)
-            self._lbl[key] = v; lay.addWidget(v); lay.addSpacing(3)
+            self._lbl[key] = v; lay.addWidget(v); lay.addSpacing(2)
         lay.addStretch()
         self._btn = QPushButton("导出为 PNG")
         self._btn.setEnabled(False)
         self._btn.setStyleSheet("""
             QPushButton { background:#0078d4;color:#fff;border:none;
-                          border-radius:4px;padding:8px;font-size:12px; }
-            QPushButton:hover    { background:#106ebe; }
-            QPushButton:disabled { background:#3a3a3a;color:#555; }
+                border-radius:4px;padding:8px;font-size:12px; }
+            QPushButton:hover    { background:#1589e0; }
+            QPushButton:disabled { background:#333;color:#555; }
         """)
         lay.addWidget(self._btn)
 
@@ -507,27 +464,17 @@ class InfoPanel(QFrame):
 class DropPlaceholder(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setStyleSheet("background:#2b2b2b;")
         lay = QVBoxLayout(self); lay.setAlignment(Qt.AlignCenter)
         for txt, sty in [
-            ("📂",             "font-size:64px;"),
+            ("📂", "font-size:56px; background:transparent;"),
             ("将 PSD / PSB 文件拖放到此处",
-             "color:#aaa;font-size:15px;margin-top:12px;"),
+             "color:#999;font-size:14px;margin-top:10px;background:transparent;"),
             ("或点击工具栏「打开文件」按钮",
-             "color:#666;font-size:12px;"),
+             "color:#555;font-size:12px;background:transparent;"),
         ]:
             lb = QLabel(txt); lb.setAlignment(Qt.AlignCenter)
             lb.setStyleSheet(sty); lay.addWidget(lb)
-
-
-# ══════════════════════════════════════════════
-#  状态枚举
-# ══════════════════════════════════════════════
-
-class _State:
-    IDLE    = "idle"
-    THUMB   = "thumb"    # 第一阶段：读缩略图
-    FULL    = "full"     # 第二阶段：合并高清
-    READY   = "ready"    # 高清已显示
 
 
 # ══════════════════════════════════════════════
@@ -543,16 +490,13 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 600)
         self.setAcceptDrops(True)
 
-        self._state        = _State.IDLE
-        self._current_file = ""
-        self._current_pm:  Optional[QPixmap] = None   # 当前显示的 pixmap
+        self._current_pm:    Optional[QPixmap] = None
+        self._current_file:  str = ""
+        self._worker:        Optional[LoadWorker]     = None
+        self._tb_worker:     Optional[ThumbBarWorker] = None
 
-        self._thumb_worker:    Optional[ThumbLoadWorker] = None
-        self._full_worker:     Optional[FullLoadWorker]  = None
-        self._thumbbar_worker: Optional[ThumbBarWorker]  = None
-
-        self._folder_files: List[str] = []
-        self._folder_index: int = -1
+        self._folder_files:  List[str] = []
+        self._folder_index:  int = -1
 
         self._setup_style()
         self._build_toolbar()
@@ -560,28 +504,26 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         QTimer.singleShot(150, self._tick_zoom)
 
-    # ── 样式 ──────────────────────────────────
-
     def _setup_style(self):
         self.setStyleSheet("""
             QMainWindow { background:#252526; }
             QToolBar {
-                background:#2d2d2d; border-bottom:1px solid #3a3a3a;
+                background:#2d2d2d; border-bottom:1px solid #333;
                 spacing:4px; padding:4px;
             }
             QToolBar QToolButton {
                 color:#ccc; background:transparent; border:none;
                 border-radius:4px; padding:6px 10px; font-size:12px;
             }
-            QToolBar QToolButton:hover   { background:#3e3e42; }
-            QToolBar QToolButton:pressed { background:#4a4a50; }
-            QToolBar QToolButton:disabled{ color:#555; }
-            QStatusBar { background:#007acc; color:#fff; font-size:11px; }
-            QProgressBar { background:#3e3e42; border:none; height:3px; }
-            QProgressBar::chunk { background:#007acc; }
+            QToolBar QToolButton:hover    { background:#3e3e42; }
+            QToolBar QToolButton:pressed  { background:#4a4a50; }
+            QToolBar QToolButton:disabled { color:#555; }
+            QStatusBar { background:#0078d4; color:#fff; font-size:11px; }
+            QProgressBar {
+                background:#005a9e; border:none; height:3px; max-width:120px;
+            }
+            QProgressBar::chunk { background:#66b8ff; }
         """)
-
-    # ── 工具栏 ────────────────────────────────
 
     def _build_toolbar(self):
         tb = QToolBar(); tb.setMovable(False)
@@ -599,7 +541,8 @@ class MainWindow(QMainWindow):
         tb.addAction(self._act_prev)
 
         self._nav_lbl = QLabel("  —  ")
-        self._nav_lbl.setStyleSheet("color:#aaa;font-size:12px;padding:0 4px;")
+        self._nav_lbl.setStyleSheet(
+            "color:#aaa;font-size:12px;padding:0 4px;background:transparent;")
         tb.addWidget(self._nav_lbl)
 
         self._act_next = QAction("下一个  ▶", self)
@@ -609,29 +552,21 @@ class MainWindow(QMainWindow):
         tb.addAction(self._act_next); tb.addSeparator()
 
         for lbl, sc, fn in [
-            ("🔍+  放大",   "Ctrl+=", lambda: self._viewer.zoom_in()),
-            ("🔍-  缩小",   "Ctrl+-", lambda: self._viewer.zoom_out()),
-            ("⊡  适应窗口", "Ctrl+0", lambda: self._viewer.zoom_fit()),
-            ("⊞  100%",    "Ctrl+1", lambda: self._viewer.zoom_reset()),
+            ("🔍+  放大",    "Ctrl+=", lambda: self._viewer.zoom_in()),
+            ("🔍-  缩小",    "Ctrl+-", lambda: self._viewer.zoom_out()),
+            ("⊡  适应窗口",  "Ctrl+0", lambda: self._viewer.zoom_fit()),
+            ("⊞  100%",     "Ctrl+1", lambda: self._viewer.zoom_reset()),
         ]:
-            act = QAction(lbl, self)
-            act.setShortcut(QKeySequence(sc))
-            act.triggered.connect(fn)
-            tb.addAction(act)
-
-        # 高清状态标签
-        self._hd_lbl = QLabel("")
-        self._hd_lbl.setStyleSheet("color:#f0a050;font-size:11px;padding:0 8px;")
-        tb.addWidget(self._hd_lbl)
-
-    # ── 中央布局 ──────────────────────────────
+            act = QAction(lbl, self); act.setShortcut(QKeySequence(sc))
+            act.triggered.connect(fn); tb.addAction(act)
 
     def _build_central(self):
         outer = QWidget()
-        ol    = QVBoxLayout(outer)
+        ol = QVBoxLayout(outer)
         ol.setContentsMargins(0,0,0,0); ol.setSpacing(0)
 
         sp = QSplitter(Qt.Horizontal); sp.setHandleWidth(1)
+
         self._info_panel = InfoPanel()
         self._info_panel.export_button.clicked.connect(self._export_png)
         sp.addWidget(self._info_panel)
@@ -639,14 +574,16 @@ class MainWindow(QMainWindow):
         right = QWidget()
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
+
         self._placeholder = DropPlaceholder()
-        self._placeholder.setStyleSheet("background:#2b2b2b;")
         rl.addWidget(self._placeholder)
+
         self._viewer = ImageViewer()
         self._viewer.hide()
         rl.addWidget(self._viewer)
+
         sp.addWidget(right)
-        sp.setStretchFactor(0,0); sp.setStretchFactor(1,1)
+        sp.setStretchFactor(0, 0); sp.setStretchFactor(1, 1)
 
         ol.addWidget(sp, 1)
 
@@ -656,16 +593,14 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(outer)
 
-    # ── 状态栏 ────────────────────────────────
-
     def _build_statusbar(self):
         self._status = QStatusBar(); self.setStatusBar(self._status)
         self._prog = QProgressBar()
-        self._prog.setRange(0,0); self._prog.setMaximumWidth(120)
-        self._prog.hide()
+        self._prog.setRange(0, 0); self._prog.hide()
         self._status.addPermanentWidget(self._prog)
         self._zoom_lbl = QLabel("缩放: 100%")
-        self._zoom_lbl.setStyleSheet("color:#fff;margin-right:8px;")
+        self._zoom_lbl.setStyleSheet(
+            "color:#fff;margin-right:8px;background:transparent;")
         self._status.addPermanentWidget(self._zoom_lbl)
         self._status.showMessage("就绪 — 打开或拖入 PSD/PSB 文件开始预览")
 
@@ -673,53 +608,45 @@ class MainWindow(QMainWindow):
         self._zoom_lbl.setText(f"缩放: {int(self._viewer.scale*100)}%")
         QTimer.singleShot(150, self._tick_zoom)
 
-    # ── 安全停止线程 ──────────────────────────
+    # ── 线程安全停止 ──────────────────────────
 
-    def _stop_worker(self, w: Optional[QThread],
-                     timeout_ms: int = 3000) -> None:
-        """取消并等待线程退出（最多 timeout_ms ms），安全清理"""
-        if w is None:
-            return
+    def _stop(self, w: Optional[QThread], ms: int = 3000):
+        if not w: return
         try:
-            if hasattr(w, "cancel"):
-                w.cancel()
+            if hasattr(w, "cancel"): w.cancel()
             if w.isRunning():
                 w.quit()
-                if not w.wait(timeout_ms):
-                    w.terminate()
-                    w.wait(1000)
-        except RuntimeError:
-            pass   # Qt 对象可能已销毁
+                if not w.wait(ms):
+                    w.terminate(); w.wait(1000)
+        except RuntimeError: pass
 
-    # ── 文件夹扫描 ────────────────────────────
+    # ── 文件夹 ────────────────────────────────
 
-    def _scan_folder(self, file_path: str):
-        folder = Path(file_path).parent
+    def _scan_folder(self, path: str):
+        folder = Path(path).parent
         files  = sorted(
             [str(p) for p in folder.iterdir()
              if p.suffix.lower() in (".psd", ".psb")],
             key=str.lower)
         self._folder_files = files
-        target = str(Path(file_path).resolve()).lower()
+        tgt = str(Path(path).resolve()).lower()
         self._folder_index = next(
-            (i for i,f in enumerate(files)
-             if str(Path(f).resolve()).lower() == target), 0)
+            (i for i, f in enumerate(files)
+             if str(Path(f).resolve()).lower() == tgt), 0)
 
         self._thumb_bar.reset(files)
         self._thumb_bar.set_selected(self._folder_index)
         self._update_nav()
 
-        # 停止旧缩略图条加载，启动新的
-        self._stop_worker(self._thumbbar_worker)
+        self._stop(self._tb_worker)
         w = ThumbBarWorker(files)
         w.one_done.connect(self._thumb_bar.set_thumb)
-        self._thumbbar_worker = w
-        w.start()
+        self._tb_worker = w; w.start()
 
     def _update_nav(self):
         n, i = len(self._folder_files), self._folder_index
-        self._act_prev.setEnabled(n>1 and i>0)
-        self._act_next.setEnabled(n>1 and i<n-1)
+        self._act_prev.setEnabled(n > 1 and i > 0)
+        self._act_next.setEnabled(n > 1 and i < n-1)
         self._nav_lbl.setText(f"  {i+1} / {n}  " if n else "  —  ")
 
     def _prev_file(self):
@@ -739,21 +666,16 @@ class MainWindow(QMainWindow):
             self._folder_index = idx
             self._load_file(self._folder_files[idx], scan_folder=False)
 
-    # ── 文件加载入口 ──────────────────────────
+    # ── 加载 ──────────────────────────────────
 
     def _open_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "打开 PSD / PSB 文件", "",
             "Photoshop 文件 (*.psd *.psb);;所有文件 (*.*)")
-        if path:
-            self._load_file(path)
+        if path: self._load_file(path)
 
     def _load_file(self, path: str, scan_folder: bool = True):
-        # 停止所有正在进行的加载任务
-        self._stop_worker(self._thumb_worker)
-        self._stop_worker(self._full_worker)
-        self._thumb_worker = None
-        self._full_worker  = None
+        self._stop(self._worker); self._worker = None
 
         if scan_folder:
             self._scan_folder(path)
@@ -762,136 +684,52 @@ class MainWindow(QMainWindow):
             self._thumb_bar.set_selected(self._folder_index)
 
         self._current_file = path
-        self._state        = _State.THUMB
-        self._hd_lbl.setText("")
-
-        # UI 进入加载状态
         self._prog.show()
         self._placeholder.show()
         self._viewer.hide()
         self._viewer.clear()
         self._info_panel.clear()
         self.setWindowTitle(f"PSD / PSB 预览器 — {Path(path).name}")
-        self._status.showMessage("读取预览图…")
+        self._status.showMessage("正在加载…")
 
-        # 第一阶段：读缩略图（极速）
-        w = ThumbLoadWorker(path)
-        w.done.connect(self._on_thumb_done)
-        w.error.connect(self._on_thumb_error)
-        self._thumb_worker = w
-        w.start()
+        w = LoadWorker(path)
+        w.done.connect(self._on_done)
+        w.error.connect(self._on_error)
+        self._worker = w; w.start()
 
-    # ── 第一阶段完成 ──────────────────────────
-
-    def _on_thumb_done(self, raw: bytes, w: int, h: int, meta: dict):
-        if self._state != _State.THUMB:
-            return   # 已切换文件，丢弃
-
+    def _on_done(self, raw: bytes, w: int, h: int, meta: dict):
         self._prog.hide()
+        pm = _to_pixmap(raw, w, h)
+        self._current_pm = pm
         self._info_panel.update_meta(meta)
         self._placeholder.hide()
         self._viewer.show()
-
-        if raw:
-            pm = bytes_to_pixmap(raw, w, h)
-            self._current_pm = pm
-            self._viewer.set_pixmap(pm, keep_view=False)
-            n, i = len(self._folder_files), self._folder_index
-            nav  = f"  [{i+1}/{n}]" if n>1 else ""
-            self._status.showMessage(
-                f"{meta.get('file_name')}{nav}  —  "
-                f"{meta.get('width')} × {meta.get('height')} px  |  预览图，高清加载中…")
-            self._hd_lbl.setText("⏳ 高清加载中…")
-        else:
-            # 没有内嵌缩略图，跳过显示，直接等高清
-            self._status.showMessage("加载高清原图中…")
-            self._prog.show()
-
-        # 第二阶段：后台合并高清
-        self._state = _State.FULL
-        fw = FullLoadWorker(self._current_file)
-        fw.done.connect(self._on_full_done)
-        fw.error.connect(self._on_full_error)
-        self._full_worker = fw
-        fw.start()
-
-    def _on_thumb_error(self, msg: str):
-        if self._state != _State.THUMB:
-            return
-        # 缩略图读失败，尝试直接加载高清
-        self._state = _State.FULL
-        self._status.showMessage("预览图读取失败，加载高清原图中…")
-        fw = FullLoadWorker(self._current_file)
-        fw.done.connect(self._on_full_done)
-        fw.error.connect(self._on_full_error)
-        self._full_worker = fw
-        fw.start()
-
-    # ── 第二阶段完成 ──────────────────────────
-
-    def _on_full_done(self, raw: bytes, w: int, h: int, file_path: str):
-        if file_path != self._current_file:
-            return   # 用户已切换，丢弃
-
-        self._prog.hide()
-        self._state = _State.READY
-
-        pm = bytes_to_pixmap(raw, w, h)
-        self._current_pm = pm
-
-        has_thumb = self._viewer.isVisible() and self._viewer._pixmap is not None
-        self._placeholder.hide()
-        self._viewer.show()
-        # 已有缩略图：保持用户当前缩放/位置替换
-        self._viewer.set_pixmap(pm, keep_view=has_thumb)
+        self._viewer.set_pixmap(pm)   # 内部自动 fit_to_window
 
         n, i = len(self._folder_files), self._folder_index
-        nav  = f"  [{i+1}/{n}]" if n>1 else ""
+        nav  = f"  [{i+1}/{n}]" if n > 1 else ""
         self._status.showMessage(
-            f"{Path(file_path).name}{nav}  —  {w} × {h} px  |  高清原图")
-        self._hd_lbl.setText("✓ 高清")
+            f"{meta.get('file_name')}{nav}  —  "
+            f"{w} × {h} px")
 
-        # 更新信息面板的实际尺寸（高清可能比缩略图大）
-        cur_meta = {
-            "file_name":   Path(file_path).name,
-            "file_size":   os.path.getsize(file_path),
-            "width":       w,
-            "height":      h,
-            "color_mode":  "—",
-            "bit_depth":   "—",
-            "layer_count": "—",
-        }
-        self._info_panel.update_meta(cur_meta)
-
-    def _on_full_error(self, msg: str):
-        if self._state not in (_State.FULL, _State.THUMB):
-            return
+    def _on_error(self, msg: str):
         self._prog.hide()
-        # 有缩略图时静默显示，仅状态栏提示
-        if self._viewer.isVisible() and self._viewer._pixmap is not None:
-            self._hd_lbl.setText("预览图")
-            self._status.showMessage(f"高清加载失败（仅显示预览图）: {msg}")
-        else:
-            self._placeholder.show()
-            self._viewer.hide()
-            self._status.showMessage(f"加载失败: {msg}")
-            QMessageBox.critical(self, "加载失败", msg)
+        self._placeholder.show(); self._viewer.hide()
+        self._status.showMessage(f"加载失败: {msg}")
+        QMessageBox.critical(self, "加载失败", msg)
 
     # ── 导出 ──────────────────────────────────
 
     def _export_png(self):
-        if self._current_pm is None:
-            return
+        if not self._current_pm: return
         path, _ = QFileDialog.getSaveFileName(
             self, "导出图像", "",
             "PNG 图像 (*.png);;JPEG 图像 (*.jpg)")
-        if not path:
-            return
+        if not path: return
         try:
-            img = self._current_pm.toImage()
-            img.save(path)
+            self._current_pm.toImage().save(path)
             self._status.showMessage(f"已导出: {path}")
-            QMessageBox.information(self, "导出成功", f"已保存到：\n{path}")
+            QMessageBox.information(self, "导出成功", f"已保存：\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
 
@@ -902,12 +740,9 @@ class MainWindow(QMainWindow):
         elif e.key() == Qt.Key_Right: self._next_file()
         else: super().keyPressEvent(e)
 
-    # ── 窗口关闭：等待所有线程安全退出 ────────
-
     def closeEvent(self, e):
-        self._stop_worker(self._thumb_worker)
-        self._stop_worker(self._full_worker)
-        self._stop_worker(self._thumbbar_worker)
+        self._stop(self._worker)
+        self._stop(self._tb_worker)
         super().closeEvent(e)
 
     # ── 拖放 ──────────────────────────────────
@@ -931,7 +766,6 @@ class MainWindow(QMainWindow):
 # ══════════════════════════════════════════════
 
 def main():
-    # Windows 下关闭 DPI 自动缩放的副作用，防止高 DPI 屏崩溃
     if hasattr(Qt, "AA_EnableHighDpiScaling"):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     if hasattr(Qt, "AA_UseHighDpiPixmaps"):
@@ -944,7 +778,6 @@ def main():
     w.show()
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
         w._load_file(sys.argv[1])
-
     sys.exit(app.exec())
 
 

@@ -1,201 +1,309 @@
 """
 PSD/PSB 文件预览核心模块
 
-加载策略（参照 2345看图王/WPS图片）：
-  Phase 1 - 极速预览：直接读内嵌缩略图（< 0.3s），立即显示
-  Phase 2 - 高清替换：后台 psd-tools composite() 合并图层，完成后无缝替换
-  内存保护：单张图超过阈值时自动缩减到安全尺寸再传给 UI
+策略：直读 PSD 内嵌"合并图像数据"（Merged Image Data）
+─────────────────────────────────────────────────────────
+PSD 格式结构：
+  [文件头 26B] [Color Mode Data] [Image Resources] [Layer Info] [合并图像数据]
+
+"合并图像数据" 是 Photoshop 保存时写入的完整高清合并图，
+与缩略图不同，它是原始分辨率、原始颜色深度的全尺寸图像。
+ACDSee / 2345看图王 / WPS图片等软件都是读这块数据，不解析图层。
+
+读取速度：与读同尺寸 BMP/PNG 相当，无需 psd-tools 合并图层。
 """
 
 import os
 import io
 import gc
 import struct
-import traceback
+import zlib
 from pathlib import Path
 from typing import Optional, Tuple
 from PIL import Image
 
 
-# 传给 UI 的最大像素边长（防 OOM）
-# 8192×8192 RGBA = 256MB，设为 8192 上限
-MAX_DISPLAY_PX = 8192
-
-# 单张图内存软上限（字节），超过则等比缩小
-MEM_LIMIT_BYTES = 512 * 1024 * 1024   # 512 MB
+MAX_DISPLAY_PX   = 8192          # 单边最大显示像素
+MEM_LIMIT_BYTES  = 600 * 1024 * 1024   # 600 MB 内存软上限
 
 
 class PSDRenderer:
-    """PSD/PSB 两阶段预览器"""
 
     def __init__(self):
-        self._file_path: Optional[str] = None
-        self._is_psb:    bool = False
+        self._is_psb: bool = False
 
-    # ── 公共：第一阶段，读内嵌缩略图（极速）─────────────────────
+    # ══════════════════════════════════════════
+    #  主入口：一次调用同时返回高清图 + meta
+    # ══════════════════════════════════════════
 
-    def load_thumbnail(self, file_path: str) -> Tuple[Optional[Image.Image], dict]:
+    def load(self, file_path: str) -> Tuple[Image.Image, dict]:
         """
-        读文件头 + 内嵌缩略图，通常 < 0.3s。
-        返回 (thumbnail_image_or_None, meta_dict)
+        读取 PSD/PSB 文件，返回 (高清合并图, meta_dict)。
+        优先读内嵌合并图像数据（极快），fallback 读内嵌缩略图。
         """
-        self._file_path = file_path
-        self._is_psb    = Path(file_path).suffix.lower() == ".psb"
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"文件不存在: {file_path}")
+        if path.suffix.lower() not in (".psd", ".psb"):
+            raise ValueError(f"不支持的格式: {path.suffix}")
 
-        meta  = self._read_header(file_path)
-        thumb = self._read_thumbnail(file_path)
-        return thumb, meta
+        self._is_psb = path.suffix.lower() == ".psb"
 
-    # ── 公共：第二阶段，合并图层得到高清图──────────────────────
+        with open(file_path, "rb") as f:
+            raw = f.read()   # 整文件读入内存（psd 本来就要解压）
 
-    def load_full(self, file_path: str) -> Image.Image:
-        """
-        用 psd-tools composite() 合并所有图层，返回高清图。
-        耗时取决于文件大小，应在后台线程调用。
-        超过内存限制时自动缩减尺寸。
-        """
-        from psd_tools import PSDImage
-
-        psd   = PSDImage.open(file_path)
-        image = psd.composite()
+        meta  = self._parse_header(raw, file_path)
+        image = self._extract_merged_image(raw, meta)
 
         if image is None:
-            image = psd.topil()
+            # fallback：内嵌缩略图
+            image = self._extract_thumbnail(raw)
 
         if image is None:
-            raise RuntimeError("无法合并图层，文件可能无可见图层")
-
-        # 释放 psd 对象，尽早回收内存
-        del psd
-        gc.collect()
+            raise RuntimeError(
+                "无法读取图像内容。\n\n"
+                "请在 Photoshop 中重新保存，确保：\n"
+                "· 存储为 PSD/PSB（非「存储为副本」）\n"
+                "· 勾选「存储缩略图」\n"
+                "· 勾选「最大兼容性」（Preferences → File Handling）"
+            )
 
         if image.mode not in ("RGBA", "RGB"):
             image = image.convert("RGBA")
+        image = _safe_resize(image)
+        return image, meta
 
-        # 内存保护：超限则等比缩小
-        image = self._safe_resize(image)
-        return image
-
-    # ── 内存安全缩放 ─────────────────────────────────────────────
-
-    @staticmethod
-    def _safe_resize(image: Image.Image) -> Image.Image:
-        """
-        若图像超过内存上限或边长上限，等比缩小到安全尺寸。
-        使用 LANCZOS 保证质量。
-        """
-        w, h      = image.size
-        channels  = len(image.getbands())
-        mem_bytes = w * h * channels
-
-        # 按内存上限计算允许的最大总像素数
-        max_px_by_mem = MEM_LIMIT_BYTES // channels  # 像素数
-
-        # 按边长上限
-        max_scale_by_edge = min(MAX_DISPLAY_PX / w, MAX_DISPLAY_PX / h, 1.0)
-        max_scale_by_mem  = (max_px_by_mem / (w * h)) ** 0.5
-
-        scale = min(max_scale_by_edge, max_scale_by_mem, 1.0)
-        if scale < 1.0:
-            new_w = max(1, int(w * scale))
-            new_h = max(1, int(h * scale))
-            image = image.resize((new_w, new_h), Image.LANCZOS)
-
-        return image
-
-    # ── 仅读缩略图（底部缩略图条用）─────────────────────────────
+    # ══════════════════════════════════════════
+    #  仅读缩略图（底部缩略图条用，极速）
+    # ══════════════════════════════════════════
 
     def load_thumbnail_only(self, file_path: str) -> Optional[Image.Image]:
-        """极速读内嵌缩略图，不读 meta，专供缩略图条批量加载"""
         try:
-            return self._read_thumbnail(file_path)
+            with open(file_path, "rb") as f:
+                # 只读前 2 MB 就够了（Image Resources 段通常在开头）
+                raw = f.read(2 * 1024 * 1024)
+            return self._extract_thumbnail(raw)
         except Exception:
             return None
 
-    # ── 文件头元信息（只读 26 字节）─────────────────────────────
+    # ══════════════════════════════════════════
+    #  解析文件头
+    # ══════════════════════════════════════════
 
-    def _read_header(self, file_path: str) -> dict:
+    def _parse_header(self, raw: bytes, file_path: str) -> dict:
         color_mode_map = {
-            0:"Bitmap",  1:"Grayscale", 2:"Indexed",
-            3:"RGB",     4:"CMYK",      7:"Multichannel",
-            8:"Duotone", 9:"Lab",
+            0:"Bitmap", 1:"Grayscale", 2:"Indexed", 3:"RGB",
+            4:"CMYK",   7:"Multichannel", 8:"Duotone", 9:"Lab",
         }
         meta = {
             "file_name":   Path(file_path).name,
             "file_size":   os.path.getsize(file_path),
             "width": 0, "height": 0,
-            "color_mode":  "RGB",
-            "bit_depth":   "—",
+            "color_mode":  "RGB", "bit_depth": "—",
             "layer_count": "—",
             "format":      "PSB" if self._is_psb else "PSD",
         }
-        try:
-            with open(file_path, "rb") as f:
-                h = f.read(26)
-            if len(h) >= 26 and h[:4] == b"8BPS":
-                meta.update({
-                    "width":      struct.unpack_from(">I", h, 18)[0],
-                    "height":     struct.unpack_from(">I", h, 14)[0],
-                    "bit_depth":  f"{struct.unpack_from('>H', h, 22)[0]} bit",
-                    "color_mode": color_mode_map.get(
-                        struct.unpack_from(">H", h, 24)[0], "未知"),
-                })
-        except Exception:
-            pass
+        if len(raw) >= 26 and raw[:4] == b"8BPS":
+            meta.update({
+                "height":     struct.unpack_from(">I", raw, 14)[0],
+                "width":      struct.unpack_from(">I", raw, 18)[0],
+                "bit_depth":  f"{struct.unpack_from('>H', raw, 22)[0]} bit",
+                "color_mode": color_mode_map.get(
+                    struct.unpack_from(">H", raw, 24)[0], "未知"),
+            })
         return meta
 
-    # ── 内嵌缩略图读取（Image Resources 段）────────────────────
+    # ══════════════════════════════════════════
+    #  核心：读取内嵌合并图像数据
+    # ══════════════════════════════════════════
 
-    def _read_thumbnail(self, file_path: str) -> Optional[Image.Image]:
+    def _extract_merged_image(self, raw: bytes,
+                              meta: dict) -> Optional[Image.Image]:
         """
-        纯二进制，顺序读取 Image Resources 段，
-        找到资源 ID 1036（JPEG）或 1033（旧版BGR），返回 PIL Image。
-        PSD/PSB 该段结构完全一致。
+        跳过 Color Mode Data、Image Resources、Layer Info 三个段，
+        直达"合并图像数据"段，解压并重建为 PIL Image。
+
+        PSD 合并图像数据格式：
+          2B  压缩类型（0=Raw, 1=PackBits RLE, 2=ZIP无预测, 3=ZIP有预测）
+          [若 RLE：每行字节数 × 行数 × 通道数，每个 2B（PSB 为 4B）]
+          [图像数据：按通道平铺，每通道完整行扫描]
         """
         try:
-            with open(file_path, "rb") as f:
-                hdr = f.read(26)
-                if len(hdr) < 26 or hdr[:4] != b"8BPS":
-                    return None
-                # 跳过 Color Mode Data
-                cmd_len = struct.unpack(">I", f.read(4))[0]
-                if cmd_len:
-                    f.seek(cmd_len, 1)
-                # 读入整个 Image Resources 段
-                res_len  = struct.unpack(">I", f.read(4))[0]
-                res_data = f.read(res_len)
+            pos = 26   # 跳过文件头
 
-            return self._parse_thumbnail(res_data)
+            # ── Color Mode Data ──
+            cmd_len = struct.unpack_from(">I", raw, pos)[0]; pos += 4
+            pos += cmd_len
+
+            # ── Image Resources ──
+            res_len = struct.unpack_from(">I", raw, pos)[0]; pos += 4
+            pos += res_len
+
+            # ── Layer and Mask Info ──
+            if self._is_psb:
+                lm_len = struct.unpack_from(">Q", raw, pos)[0]; pos += 8
+            else:
+                lm_len = struct.unpack_from(">I", raw, pos)[0]; pos += 4
+            pos += lm_len
+
+            # ── 合并图像数据段 ──
+            if pos + 2 > len(raw):
+                return None
+
+            compression = struct.unpack_from(">H", raw, pos)[0]; pos += 2
+
+            w        = meta["width"]
+            h        = meta["height"]
+            channels = 3   # 默认 RGB，多通道时取前3
+
+            if w <= 0 or h <= 0:
+                return None
+
+            # 解压数据
+            if compression == 0:
+                # Raw：直接读
+                plane_size = w * h
+                data = raw[pos: pos + channels * plane_size]
+
+            elif compression == 1:
+                # PackBits RLE
+                # 每行字节计数表
+                bpc = 4 if self._is_psb else 2   # 每个计数的字节数
+                count_table_size = channels * h * bpc
+                counts_raw = raw[pos: pos + count_table_size]
+                pos += count_table_size
+
+                fmt = ">I" if self._is_psb else ">H"
+                row_bytes = [
+                    struct.unpack_from(fmt, counts_raw, i * bpc)[0]
+                    for i in range(channels * h)
+                ]
+
+                planes = []
+                rp = pos
+                for ch in range(channels):
+                    ch_rows = []
+                    for row in range(h):
+                        idx   = ch * h + row
+                        n     = row_bytes[idx]
+                        chunk = raw[rp: rp + n]; rp += n
+                        ch_rows.append(_unpack_bits(chunk, w))
+                    planes.append(b"".join(ch_rows))
+                data = b"".join(planes)
+
+            elif compression in (2, 3):
+                # ZIP（有/无预测）
+                zdata = raw[pos:]
+                try:
+                    data = zlib.decompress(zdata)
+                except Exception:
+                    data = zlib.decompress(zdata, -15)
+
+            else:
+                return None
+
+            # 重建图像：通道平铺 → 交错 RGBA
+            if len(data) < w * h * channels:
+                return None
+
+            plane = w * h
+            if channels >= 3:
+                r_plane = data[0          : plane]
+                g_plane = data[plane      : plane*2]
+                b_plane = data[plane*2    : plane*3]
+                # 交错 RGB
+                img_bytes = bytearray(plane * 3)
+                img_bytes[0::3] = r_plane
+                img_bytes[1::3] = g_plane
+                img_bytes[2::3] = b_plane
+                img = Image.frombytes("RGB", (w, h), bytes(img_bytes))
+                if channels >= 4:
+                    a_plane = data[plane*3: plane*4]
+                    alpha   = Image.frombytes("L", (w, h), a_plane)
+                    img.putalpha(alpha)
+                    return img.convert("RGBA")
+                return img.convert("RGBA")
+
         except Exception:
-            return None
-
-    def _parse_thumbnail(self, data: bytes) -> Optional[Image.Image]:
-        pos, end = 0, len(data)
-        while pos + 12 <= end:
-            if data[pos:pos+4] != b"8BIM":
-                break
-            pos += 4
-            res_id = struct.unpack_from(">H", data, pos)[0]; pos += 2
-            # Pascal string 跳过
-            ps_len  = data[pos]; pos += 1
-            pos    += ps_len + (1 if (ps_len + 1) % 2 != 0 else 0)
-            if pos + 4 > end:
-                break
-            data_len = struct.unpack_from(">I", data, pos)[0]; pos += 4
-
-            if res_id in (1036, 1033):
-                jpeg_start = pos + 28
-                jpeg_len   = data_len - 28
-                if jpeg_len > 0 and jpeg_start + jpeg_len <= end:
-                    try:
-                        img = Image.open(io.BytesIO(data[jpeg_start:jpeg_start+jpeg_len]))
-                        img.load()
-                        if res_id == 1033:
-                            r, g, b = img.convert("RGB").split()
-                            img = Image.merge("RGB", (b, g, r))
-                        return img.convert("RGBA")
-                    except Exception:
-                        pass
-
-            pos += data_len + (data_len % 2)
+            pass
         return None
+
+    # ══════════════════════════════════════════
+    #  Fallback：内嵌缩略图（Image Resources）
+    # ══════════════════════════════════════════
+
+    def _extract_thumbnail(self, raw: bytes) -> Optional[Image.Image]:
+        try:
+            pos = 26
+            if pos + 4 > len(raw): return None
+            cmd_len = struct.unpack_from(">I", raw, pos)[0]; pos += 4
+            pos += cmd_len
+            if pos + 4 > len(raw): return None
+            res_len = struct.unpack_from(">I", raw, pos)[0]; pos += 4
+            res_end = pos + res_len
+            res_data = raw[pos: res_end]
+
+            p, end = 0, len(res_data)
+            while p + 12 <= end:
+                if res_data[p:p+4] != b"8BIM": break
+                p += 4
+                res_id = struct.unpack_from(">H", res_data, p)[0]; p += 2
+                ps_len = res_data[p]; p += 1
+                p += ps_len + (1 if (ps_len+1)%2 != 0 else 0)
+                if p + 4 > end: break
+                dlen = struct.unpack_from(">I", res_data, p)[0]; p += 4
+                if res_id in (1036, 1033):
+                    js = p + 28; jl = dlen - 28
+                    if jl > 0:
+                        try:
+                            img = Image.open(io.BytesIO(res_data[js:js+jl]))
+                            img.load()
+                            if res_id == 1033:
+                                r,g,b = img.convert("RGB").split()
+                                img = Image.merge("RGB",(b,g,r))
+                            return img.convert("RGBA")
+                        except Exception: pass
+                p += dlen + (dlen % 2)
+        except Exception: pass
+        return None
+
+
+# ══════════════════════════════════════════════
+#  PackBits 解压（RLE）
+# ══════════════════════════════════════════════
+
+def _unpack_bits(src: bytes, expected_len: int) -> bytes:
+    out = bytearray()
+    i   = 0
+    while i < len(src) and len(out) < expected_len:
+        n = src[i]; i += 1
+        if n == 128:
+            continue
+        elif n > 128:
+            count = 257 - n
+            if i < len(src):
+                out.extend([src[i]] * count); i += 1
+        else:
+            count = n + 1
+            out.extend(src[i:i+count]); i += count
+    return bytes(out[:expected_len])
+
+
+# ══════════════════════════════════════════════
+#  内存安全缩放
+# ══════════════════════════════════════════════
+
+def _safe_resize(image: Image.Image) -> Image.Image:
+    w, h = image.size
+    ch   = len(image.getbands())
+    scale = min(
+        MAX_DISPLAY_PX / w,
+        MAX_DISPLAY_PX / h,
+        ((MEM_LIMIT_BYTES // ch) / (w * h)) ** 0.5,
+        1.0,
+    )
+    if scale < 1.0:
+        image = image.resize(
+            (max(1, int(w*scale)), max(1, int(h*scale))),
+            Image.LANCZOS)
+    return image
