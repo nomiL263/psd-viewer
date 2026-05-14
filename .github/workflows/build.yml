@@ -1,0 +1,38 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: 打包 exe
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "PSD_Viewer" `
+            --hidden-import psd_tools `
+            --hidden-import psd_tools.composite `
+            --hidden-import psd_tools.compression `
+            --hidden-import PIL `
+            --collect-all psd_tools `
+            src/main.py
+      - name: 上传 exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSD_Viewer_Windows
+          path: dist/PSD_Viewer.exe
+          retention-days: 30
