@@ -2,9 +2,10 @@
 PSD/PSB 预览器 - 主 GUI 界面
 基于 PySide6 构建
 
-新增功能：
+功能：
+- 两阶段加载：先显示内嵌缩略图（极快），后台合并原图后自动替换为高清版
 - 文件夹浏览：左右方向键 / 工具栏按钮切换同目录内的 PSD/PSB 文件
-- 滚轮缩放：直接滚轮缩放（无需按 Ctrl）
+- 滚轮缩放：直接滚轮缩放（以鼠标位置为中心）
 - 左键拖拽：放大后可用左键拖动平移图像
 """
 
@@ -50,6 +51,34 @@ class LoadWorker(QThread):
             self.finished.emit(image, meta)
         except Exception as e:
             self.error.emit(str(e))
+
+
+# ─────────────────────────────────────────────
+# 高清原图加载线程（后台合并图层）
+# ─────────────────────────────────────────────
+
+class FullResWorker(QThread):
+    """在后台用 psd-tools 合并所有图层，完成后发出 finished 信号"""
+    finished = Signal(object, str)   # (PIL.Image, file_path)
+    error    = Signal(str)
+
+    def __init__(self, file_path: str):
+        super().__init__()
+        self.file_path = file_path
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            renderer = PSDRenderer()
+            image = renderer.load_full(self.file_path)
+            if not self._cancelled:
+                self.finished.emit(image, self.file_path)
+        except Exception as e:
+            if not self._cancelled:
+                self.error.emit(str(e))
 
 
 # ─────────────────────────────────────────────
@@ -350,14 +379,16 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._current_image: Optional[Image.Image] = None
+        self._current_file: str = ""          # 当前加载的文件路径
         self._worker: Optional[LoadWorker] = None
+        self._full_worker: Optional[FullResWorker] = None  # 高清加载线程
 
         # ── 文件夹浏览状态 ──
-        self._folder_files: List[str] = []   # 当前目录内所有 PSD/PSB
-        self._folder_index: int = -1          # 当前文件在列表中的位置
+        self._folder_files: List[str] = []
+        self._folder_index: int = -1
 
-        # ── 预加载缓存（相邻文件） ──
-        self._preload_cache: dict = {}        # {file_path: PIL.Image}
+        # ── 预加载缓存（相邻文件缩略图） ──
+        self._preload_cache: dict = {}
         self._preload_worker: Optional[LoadWorker] = None
 
         self._setup_style()
@@ -443,6 +474,13 @@ class MainWindow(QMainWindow):
         act_zoom_100.setShortcut(QKeySequence("Ctrl+1"))
         act_zoom_100.triggered.connect(lambda: self._viewer.zoom_reset())
         tb.addAction(act_zoom_100)
+
+        tb.addSeparator()
+
+        # 高清加载状态标签
+        self._hd_label = QLabel("")
+        self._hd_label.setStyleSheet("color:#f0a050; font-size:11px; padding:0 6px;")
+        tb.addWidget(self._hd_label)
 
     # ── 中央布局 ────────────────────────────────
 
@@ -557,14 +595,21 @@ class MainWindow(QMainWindow):
         else:
             self._update_nav()
 
-        # 命中预加载缓存：直接显示，无需等待
+        # 取消正在进行的高清加载
+        if self._full_worker and self._full_worker.isRunning():
+            self._full_worker.cancel()
+            self._full_worker.quit()
+            self._full_worker = None
+        self._hd_label.setText("")
+        self._current_file = path
+
+        # 命中预加载缓存：直接显示缩略图，再启动高清加载
         if path in self._preload_cache:
             cached_img = self._preload_cache[path]
             self._progress.hide()
             self._current_image = cached_img
-            # 元信息单独快速读取（只读 26 字节头）
             try:
-                r = PSDRenderer()
+                r    = PSDRenderer()
                 meta = r._read_header(path)
                 meta["file_name"] = Path(path).name
                 meta["file_size"] = os.path.getsize(path)
@@ -582,11 +627,12 @@ class MainWindow(QMainWindow):
             nav = f"  [{idx+1}/{n}]" if n > 1 else ""
             self._status.showMessage(
                 f"已加载：{meta.get('file_name')}{nav}  —  "
-                f"{meta.get('width')} × {meta.get('height')} px")
-            QTimer.singleShot(100, self._preload_neighbors)
+                f"{meta.get('width')} × {meta.get('height')} px  |  预览图")
+            self._start_full_res(path)
+            QTimer.singleShot(200, self._preload_neighbors)
             return
 
-        # 未命中缓存：正常后台加载
+        # 未命中缓存：后台加载缩略图
         self._progress.show()
         self._status.showMessage("正在加载…")
         self._placeholder.show()
@@ -613,10 +659,58 @@ class MainWindow(QMainWindow):
         nav = f"  [{idx+1}/{n}]" if n > 1 else ""
         self._status.showMessage(
             f"已加载：{meta.get('file_name')}{nav}  —  "
-            f"{meta.get('width')} × {meta.get('height')} px")
+            f"{meta.get('width')} × {meta.get('height')} px  |  预览图")
 
-        # 加载完成后，后台预加载前后相邻文件
-        QTimer.singleShot(100, self._preload_neighbors)
+        # 缩略图显示后，立即在后台加载高清原图
+        self._start_full_res(self._current_file)
+
+        # 同时预加载相邻文件缩略图
+        QTimer.singleShot(200, self._preload_neighbors)
+
+    def _start_full_res(self, file_path: str):
+        """启动高清原图后台加载，如果已有任务先取消"""
+        # 取消上一个未完成的高清任务
+        if self._full_worker and self._full_worker.isRunning():
+            self._full_worker.cancel()
+            self._full_worker.quit()
+            self._full_worker = None
+
+        self._hd_label.setText("⏳ 加载高清中…")
+
+        worker = FullResWorker(file_path)
+        worker.finished.connect(self._on_full_res_finished)
+        worker.error.connect(self._on_full_res_error)
+        self._full_worker = worker
+        worker.start()
+
+    def _on_full_res_finished(self, image: Image.Image, file_path: str):
+        # 如果用户已切换到其他文件，丢弃结果
+        if file_path != self._current_file:
+            return
+
+        self._current_image = image
+        # 记录当前缩放状态，替换图像后恢复
+        old_scale  = self._viewer.scale
+        old_is_fit = self._viewer._is_fit
+        self._viewer.set_image(image)
+
+        # 恢复用户之前的缩放（不强制跳回适应窗口）
+        if not old_is_fit:
+            self._viewer._is_fit  = False
+            self._viewer._scale   = old_scale
+            self._viewer._update_display()
+
+        self._hd_label.setText("✓ 高清")
+        n   = len(self._folder_files)
+        idx = self._folder_index
+        nav = f"  [{idx+1}/{n}]" if n > 1 else ""
+        self._status.showMessage(
+            f"已加载：{Path(file_path).name}{nav}  —  "
+            f"{image.width} × {image.height} px  |  高清原图")
+
+    def _on_full_res_error(self, error_msg: str):
+        # 高清加载失败静默处理，缩略图依然可用
+        self._hd_label.setText("预览图")
 
     def _preload_neighbors(self):
         """后台静默预加载相邻文件，切换时直接从缓存取"""

@@ -197,6 +197,30 @@ class PSDRenderer:
             "文件 → 存储为 → 勾选「存储缩略图 / Thumbnail」"
         )
 
+    # ── 高清原图合并（慢，供后台线程调用）────────────────────────
+
+    def load_full(self, file_path: str) -> Image.Image:
+        """
+        用 psd-tools 合并所有图层，返回原始尺寸高清图。
+        速度较慢（取决于文件大小和图层数），应在后台线程调用。
+        """
+        from psd_tools import PSDImage
+
+        psd   = PSDImage.open(file_path)
+        image = psd.composite()          # 合并全部图层
+
+        if image is None:
+            # 部分文件 composite() 返回 None，fallback 读合并数据块
+            image = psd.topil()
+
+        if image is None:
+            raise RuntimeError("无法合并图层，文件可能不包含可见图层")
+
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+
+        return image
+
     # ── 对外接口 ─────────────────────────────────────────────────
 
     def composite(self) -> Image.Image:
