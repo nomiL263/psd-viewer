@@ -36,10 +36,12 @@ class PSDRenderer:
     #  主入口：一次调用同时返回高清图 + meta
     # ══════════════════════════════════════════
 
-    def load(self, file_path: str) -> Tuple[Image.Image, dict]:
+    def load(self, file_path: str) -> Tuple[Optional[Image.Image], dict]:
         """
-        读取 PSD/PSB 文件，返回 (高清合并图, meta_dict)。
-        优先读内嵌合并图像数据（极快），fallback 读内嵌缩略图。
+        读取 PSD/PSB 文件，返回 (合并图或None, meta_dict)。
+        - 有合并图：返回高清 PIL Image
+        - 无合并图但文件有效：返回 (None, meta)，调用方显示友好提示
+        - 文件损坏/不存在：抛异常
         """
         path = Path(file_path)
         if not path.exists():
@@ -50,23 +52,18 @@ class PSDRenderer:
         self._is_psb = path.suffix.lower() == ".psb"
 
         with open(file_path, "rb") as f:
-            raw = f.read()   # 整文件读入内存（psd 本来就要解压）
+            raw = f.read()
 
         meta  = self._parse_header(raw, file_path)
         image = self._extract_merged_image(raw, meta)
 
         if image is None:
-            # fallback：内嵌缩略图
             image = self._extract_thumbnail(raw)
 
+        # image 仍为 None：文件有效但无图像数据，返回 (None, meta)
+        # 调用方（LoadWorker）负责发 no_merged 信号显示友好提示
         if image is None:
-            raise RuntimeError(
-                "无法读取图像内容。\n\n"
-                "请在 Photoshop 中重新保存，确保：\n"
-                "· 存储为 PSD/PSB（非「存储为副本」）\n"
-                "· 勾选「存储缩略图」\n"
-                "· 勾选「最大兼容性」（Preferences → File Handling）"
-            )
+            return None, meta
 
         if image.mode not in ("RGBA", "RGB"):
             image = image.convert("RGBA")
